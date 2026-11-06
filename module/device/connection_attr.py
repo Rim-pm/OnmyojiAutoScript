@@ -233,28 +233,53 @@ class ConnectionAttr:
 
     @cached_property
     def adb_binary(self):
-        # Try adb in deploy.yaml
-        # from module.webui.setting import State
-        # file = State.deploy_config.AdbExecutable
-        # file = file.replace('\\', '/')
-        # if os.path.exists(file):
-        #     return os.path.abspath(file)
-        #
-        # # Try existing adb.exe
-        # for file in self.adb_binary_list:
-        #     if os.path.exists(file):
-        #         return os.path.abspath(file)
+        """
+        Resolve the adb executable path.
 
-        # Try adb in python environment
-        import sys
-        file = os.path.join(sys.executable, '../Lib/site-packages/adbutils/binaries/adb.exe')
-        file = os.path.abspath(file).replace('\\', '/')
-        if os.path.exists(file):
-            return file
+        Order: AdbExecutable in deploy.yaml -> adb bundled with adbutils in current
+        interpreter -> ./bin/adb in project -> `adb` in system PATH.
 
-        # Use adb in system PATH
-        file = 'adb'
-        return file
+        Never derive paths from sys.executable. Alas runs on a portable python
+        (`toolkit/python.exe` with `toolkit/Lib` next to it), but a standard venv is
+        `.venv/Scripts/python.exe` with `.venv/Lib`. Joining `sys.executable + '../Lib'`
+        therefore yields `.venv/Scripts/Lib/...` on venv, which never exists. Ask the
+        installed package for its own location instead, this is layout agnostic.
+        """
+        import adbutils
+
+        exe_name = 'adb.exe' if os.name == 'nt' else 'adb'
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        candidates = []
+
+        # 1. Explicit config in deploy.yaml.
+        # Read only, do not touch State.deploy_config, DeployConfig() rewrites the file
+        # on init and that has no business happening during device init.
+        try:
+            from deploy.utils import poor_yaml_read
+            file = poor_yaml_read(os.path.join(root, 'config', 'deploy.yaml')).get('AdbExecutable')
+            if file:
+                candidates.append(file if os.path.isabs(file) else os.path.join(root, file))
+        except Exception as e:
+            logger.warning(f'Unable to read AdbExecutable from deploy.yaml: {e}')
+
+        # 2. adb bundled with adbutils in current python environment
+        candidates.append(os.path.join(os.path.dirname(adbutils.__file__), 'binaries', exe_name))
+
+        # 3. adb shipped inside the project
+        for file in self.adb_binary_list:
+            if not os.path.isabs(file) and not file.startswith('/'):
+                candidates.append(os.path.join(root, file))
+            else:
+                candidates.append(file)
+
+        for file in candidates:
+            file = os.path.abspath(file).replace('\\', '/')
+            if os.path.exists(file):
+                return file
+
+        # 4. Use adb in system PATH
+        logger.warning(f'No adb executable found in {candidates}, fallback to `adb` in system PATH')
+        return 'adb'
 
     @cached_property
     def adb_client(self) -> AdbClient:

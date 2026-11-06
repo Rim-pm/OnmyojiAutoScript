@@ -276,3 +276,6 @@ oas.ps1
 
 # Per-instance FrogBoss prediction and result history
 data/frog_oas/
+
+# Local agent workspace (session memory, not part of the project)
+.workbuddy/
