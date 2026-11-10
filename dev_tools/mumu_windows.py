@@ -22,6 +22,9 @@ GetWindowRect：后者把窗口四周的透明投影也计入，直接按它切�
 place（默认动作）会先补齐没在运行的实例、等窗口真正就绪后再摆；不想启动就加
 --no-start，只想看差异就加 --dry-run。
 
+start/stop/restart 只作用于布局需要的那几个实例：stop 不会顺手关掉别的布局
+（例如 hand 3 的 3 号机）还在跑的实例。
+
 用法（项目根目录）:
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows            # 等价 place base
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows hand 2
@@ -30,7 +33,8 @@ place（默认动作）会先补齐没在运行的实例、等窗口真正就绪
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows --list
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows hand 2 --no-start
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows start hand 3   # 启动并摆放
-    .venv\\Scripts\\python.exe -m dev_tools.mumu_windows stop
+    .venv\\Scripts\\python.exe -m dev_tools.mumu_windows stop           # 只关 base 的实例
+    .venv\\Scripts\\python.exe -m dev_tools.mumu_windows stop hand 3    # 只关 0/1/2
     .venv\\Scripts\\python.exe -m dev_tools.mumu_windows restart hand 2
 """
 import argparse
@@ -84,12 +88,14 @@ HAND3_THIRD_HEIGHT = 464
 # 规划中但还没实现的布局：显式列出，避免与「拼错的布局名」混为一谈
 LAYOUTS_TODO = ('hand1',)
 
-# MuMuManager.exe 的常见位置，注册表读不到时的兜底
+# MuMuManager.exe 的常见位置，注册表读不到时的兜底（只放默认安装目录，不写本机路径）
 MANAGER_FALLBACKS = (
     r'C:\Program Files\Netease\MuMuPlayer-12.0\shell\MuMuManager.exe',
     r'C:\Program Files\Netease\MuMuPlayer-12.0\nx_main\MuMuManager.exe',
-    r'D:\APPs\MuMuPlayer\nx_main\MuMuManager.exe',
 )
+
+# 单次 MuMuManager 调用的最长等待时间：正常都是秒级返回，卡住说明它自己挂了
+MANAGER_TIMEOUT = 120
 
 # 等待窗口稳定：模拟器启动后窗口会先出现在默认位置，随后再被自己改一次大小，
 # 过早 SetWindowPos 会被它覆盖。这里用轮询判断「连续一段时间矩形不再变化」，
@@ -360,6 +366,8 @@ def place_layout(name: str, variant: str, dry_run: bool, manager_exe: str = '',
 def find_manager(explicit: str = '') -> str:
     """定位 MuMuManager.exe：显式指定 > 注册表安装目录 > 运行中的主程序 > 常见路径。"""
     if explicit:
+        if not os.path.isfile(explicit):
+            raise FileNotFoundError(f'指定的 MuMuManager.exe 不存在：{explicit}')
         return explicit
 
     import winreg
@@ -397,7 +405,13 @@ def find_manager(explicit: str = '') -> str:
 
 def manager(manager_exe: str, *args: str) -> dict:
     """调用 MuMuManager 并把 JSON 输出解析成 dict；失败抛 RuntimeError。"""
-    result = subprocess.run([manager_exe, *args], capture_output=True)
+    try:
+        result = subprocess.run([manager_exe, *args], capture_output=True,
+                                timeout=MANAGER_TIMEOUT)
+    except FileNotFoundError:
+        raise RuntimeError(f'找不到 MuMuManager.exe：{manager_exe}')
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'MuMuManager {" ".join(args)} 超过 {MANAGER_TIMEOUT}s 无响应')
     stdout = result.stdout.decode('utf-8', errors='replace').strip()
     if result.returncode != 0 or not stdout:
         stderr = result.stderr.decode('utf-8', errors='replace').strip()
@@ -531,7 +545,12 @@ def main() -> int:
     indexes = LAYOUT_INDEXES[layout]
     try:
         if action == 'stop':
-            targets = running_indexes(manager_exe) or indexes
+            # 只关当前布局涉及、且确实在运行的实例，别把别的布局/账号一并关掉
+            running = running_indexes(manager_exe)
+            targets = tuple(i for i in indexes if i in running)
+            if not targets:
+                logger.info(f'布局 {layout} 的实例 {list(indexes)} 都没在运行，无需关闭')
+                return 0
             stop_instances(manager_exe, targets)
             logger.info('实例已关闭')
             return 0
