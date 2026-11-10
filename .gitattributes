@@ -3,6 +3,7 @@
 *.png -text
 *.bat text eol=crlf
 # 只对本项目自己的启动脚本固定 CRLF；fluentui 下的 .ps1 属上游，不动
+/oas.ps1 text eol=crlf
 deploy/launcher/oas.ps1 text eol=crlf
 *.txt text eol=lf
 *.sh text eol=lf

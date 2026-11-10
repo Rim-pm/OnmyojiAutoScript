@@ -13,7 +13,7 @@
 #       oas mumu hand 2              摆成指定布局（同上，缺实例先启动）
 #       oas mumu hand 2 --no-start   只摆放已在运行的实例
 #       oas mumu start hand 3        启动实例并摆放
-#       oas mumu stop                关闭实例
+#       oas mumu stop                关闭 base 布局涉及的实例
 #       oas mumu restart hand 2      重启实例并摆放
 #       oas mumu --list              只列出当前位置大小
 #       oas mumu --dry-run           只报告差异不调整
@@ -30,7 +30,14 @@ param(
 # 本脚本在 deploy\launcher\ 下，项目根是它的上两级；不用 $PSScriptRoot 直接当根，
 # 否则 .venv、config、server.py 全都会找不到。
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# 解释器：优先本项目自己的 .venv，其次上游安装包用的 toolkit 便携布局。
+# 两个都没有时仍按 .venv 报错，提示更直观。
 $Py = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path $Py)) {
+    $toolkitPy = Join-Path $Root "toolkit\python.exe"
+    if (Test-Path $toolkitPy) { $Py = $toolkitPy }
+}
 
 # 后端端口：优先读 config\deploy.yaml 的 WebuiPort，读不到则用 22288
 $Port = 22288
@@ -156,6 +163,7 @@ function Invoke-MumuWindows {
     # --dry-run/--list 等参数原样透传，具体逻辑都在 dev_tools\mumu_windows.py。
     # 必须用脚本路径而不是 -m：-m 依赖当前目录在 sys.path 里，从别的目录调用会
     # 报 ModuleNotFoundError。工作目录同样切到项目根，日志才落到项目 log/ 下。
+    # 只让 python 的输出原样上屏，函数本身不返回值：$LASTEXITCODE 由调用处读取。
     $scriptPath = Join-Path $Root "dev_tools\mumu_windows.py"
     Push-Location $Root
     try {
@@ -182,7 +190,7 @@ function Show-Help {
     Write-Host "                       oas mumu hand 3          再加第三个窗口贴在左下角"
     Write-Host "                       oas mumu hand 2 --no-start  只摆放已在运行的实例"
     Write-Host "                       oas mumu start [布局]    启动实例（主程序没开会自动拉起）并摆放"
-    Write-Host "                       oas mumu stop            关闭实例"
+    Write-Host "                       oas mumu stop            关闭当前布局涉及的实例"
     Write-Host "                       oas mumu restart [布局]  重启实例并摆放"
     Write-Host "                       oas mumu --list          只列出当前位置大小"
     Write-Host "                       oas mumu --dry-run       只报告差异不调整"
@@ -203,7 +211,9 @@ switch ($Cmd) {
     "status" { Show-Status }
     "web"    { Start-Process $Base }
     "run"    { Invoke-Script }
-    "mumu"   { Invoke-MumuWindows }
+    # 先把 python 的退出码存下来再 exit：pwsh -File 时即进程退出码；被 & 或
+    # dot-source 调用时只结束本脚本并留下 $LASTEXITCODE，不会关掉调用方会话。
+    "mumu"   { Invoke-MumuWindows; exit $LASTEXITCODE }
     default  {
         Write-Host "未知命令：$Cmd" -ForegroundColor Yellow
         Write-Host ""
