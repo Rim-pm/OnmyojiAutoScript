@@ -272,7 +272,8 @@ console.bat
 .vscode/*
 tasks/AutoCheckinBigGod/frida-server-17.6.2-android-x86_64
 oas.bat
-oas.ps1
+# 项目根的 oas.ps1 只是本地兼容转发（真正实现在 deploy/launcher/oas.ps1，已入库）
+/oas.ps1
 
 # Per-instance FrogBoss prediction and result history
 data/frog_oas/
