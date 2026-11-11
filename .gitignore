@@ -278,3 +278,7 @@ data/frog_oas/
 
 # Local agent workspace (session memory, not part of the project)
 .workbuddy/
+
+# oasc instance-control runtime state (disable snapshots / log reports)
+nakk/state/
+nakk/stats/
