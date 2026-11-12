@@ -17,6 +17,7 @@ from module.device.method.windows import Window
 from module.device.method.droidcast import DroidCast
 from module.device.method.scrcpy import Scrcpy
 from module.device.method.nemu_ipc import NemuIpc
+from module.device.method.utils import is_blank_screenshot
 from module.exception import RequestHumanTakeover, ScriptError
 from module.logger import logger
 
@@ -28,6 +29,13 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
     _screenshot_interval = Timer(0.1)
     _last_save_time = {}
     image: np.ndarray
+
+    # 连续空帧达到阈值且窗口自身重绘也救不回来时，改走与 serial 绑定的 ADB 截图
+    BLANK_FRAME_FALLBACK_THRESHOLD = 10
+    # 兜底状态下每隔多久试一次原截图方法，恢复后自动切回
+    FALLBACK_RECHECK_INTERVAL = 60
+    # 一次兜底探测失败后的冷却时间
+    FALLBACK_PROBE_COOLDOWN = 30
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -48,6 +56,86 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
             'nemu_ipc': self.screenshot_nemu_ipc
         }
 
+    def _log_throttled(self, attr, interval, message, level='warning'):
+        """同类告警按时间间隔限频，避免空帧时每帧刷屏。"""
+        now = time.time()
+        if now - getattr(self, attr, 0) > interval:
+            setattr(self, attr, now)
+            getattr(logger, level)(message)
+
+    @property
+    def _active_screenshot_method(self):
+        """当前实际使用的截图方法；默认取配置，异常时被兜底逻辑改写成 'ADB'。"""
+        return getattr(self, '_screenshot_method_active', None) \
+            or self.config.script.device.screenshot_method
+
+    def _check_frame_health(self):
+        """每帧健康检查。
+
+        `check_screen_black()` 只在实例生命周期里检查一次（且只认纯黑），
+        虚拟屏中途产生的单色空帧会静默进入页面识别，表现为无限
+        `Page detect miss`。这里逐帧判断，必要时切到 ADB 截图兜底，
+        并在原通道恢复后自动切回。
+
+        Returns:
+            bool: 当前 self.image 是否为有效帧
+        """
+        configured = self.config.script.device.screenshot_method
+        active = self._active_screenshot_method
+        valid = not is_blank_screenshot(self.image)
+
+        if active != configured:
+            now = time.time()
+            if now - getattr(self, '_fallback_recheck_at', 0) > self.FALLBACK_RECHECK_INTERVAL:
+                self._fallback_recheck_at = now
+                original = self.screenshot_methods.get(configured)
+                if original is not None:
+                    try:
+                        if not is_blank_screenshot(original()):
+                            self._screenshot_method_active = configured
+                            logger.info(
+                                f'Screenshot method {configured} recovered, '
+                                f'switching back from {active}')
+                    except Exception as e:
+                        logger.warning(f'Recheck of {configured} failed: {e}')
+            return valid
+
+        if valid:
+            self._blank_frame_streak = 0
+            return True
+
+        self._blank_frame_streak = getattr(self, '_blank_frame_streak', 0) + 1
+        if self._blank_frame_streak < self.BLANK_FRAME_FALLBACK_THRESHOLD:
+            return False
+
+        self._blank_frame_streak = 0
+        now = time.time()
+        if now - getattr(self, '_fallback_probe_at', 0) < self.FALLBACK_PROBE_COOLDOWN:
+            return False
+        self._fallback_probe_at = now
+        try:
+            probe = self.screenshot_adb()
+        except Exception as e:
+            logger.warning(f'ADB screenshot fallback failed: {e}')
+            return False
+        if is_blank_screenshot(probe):
+            # 两条通道都是空帧，说明是游戏本身黑屏/未启动，切过去也没意义
+            self._log_throttled(
+                '_all_blank_warn_at', 30,
+                'Window and ADB both returned blank frames, '
+                'the emulator may be showing a blank screen itself')
+            return False
+
+        self.image = probe
+        self._screenshot_method_active = 'ADB'
+        self._fallback_recheck_at = now
+        logger.warning(
+            f'Screenshot method {configured} returned '
+            f'{self.BLANK_FRAME_FALLBACK_THRESHOLD} blank frames in a row '
+            f'(virtual/remote display?). Switched to ADB screenshot, '
+            f'which reads frames directly from {getattr(self, "serial", "device")}.')
+        return True
+
     def screenshot(self):
         """
         Returns:
@@ -57,11 +145,14 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
         self._screenshot_interval.reset()
 
         for _ in range(2):
-            method = self.screenshot_methods.get(
-                self.config.script.device.screenshot_method,
-                self.screenshot_adb  # 第二个参数默认的是screenshot_adb
-            )
-            self.image = method()
+            method_name = self._active_screenshot_method
+            method = self.screenshot_methods.get(method_name) or self.screenshot_adb
+            try:
+                self.image = method()
+            except Exception as e:
+                logger.warning(f'Screenshot method {method_name} failed: {e}, using ADB')
+                self._screenshot_method_active = 'ADB'
+                self.image = self.screenshot_adb()
 
             # if self.config.Emulator_ScreenshotDedithering:
             #     # This will take 40-60ms
@@ -72,7 +163,7 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
             if self.config.script.error.save_error:
                 self.screenshot_deque.append({'time': datetime.now(), 'image': self.image})
 
-            if self.check_screen_size() and self.check_screen_black():
+            if self.check_screen_size() and self.check_screen_black() and self._check_frame_health():
                 break
             else:
                 continue

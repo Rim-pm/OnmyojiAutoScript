@@ -1,6 +1,7 @@
 # This Python file uses the following encoding: utf-8
 # @author runhey
 # github https://github.com/runhey
+import ctypes
 import cv2
 from numpy import frombuffer, uint8, array, random
 import numpy as np
@@ -29,8 +30,17 @@ from module.base.timer import timer
 from module.logger import logger
 from module.device.handle import Handle, window_scale_rate, EmulatorFamily
 from module.device.method.desktop_impl import dpi_awareness
+from module.device.method.utils import is_blank_screenshot
 
 
+# user32!PrintWindow 的 PW_RENDERFULLCONTENT 模式（Win8+）。
+# 显式声明 argtypes，避免 64 位下 HWND/HDC 被当成 c_int 截断。
+try:
+    _PRINT_WINDOW = ctypes.windll.user32.PrintWindow
+    _PRINT_WINDOW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    _PRINT_WINDOW.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _PRINT_WINDOW = None
 
 
 class Window(Handle):
@@ -40,14 +50,42 @@ class Window(Handle):
     DESKTOP_MOVE_STEP = 60
     DESKTOP_MOVE_MAX_POINTS = 12
 
+    # 远程桌面 / 虚拟显示器（如 UU 远程虚拟屏）下 DWM 不会把模拟器窗口合成到
+    # 屏幕上，GetWindowDC + BitBlt 会持续返回整屏单色的空帧，页面识别因此全灭。
+    # PrintWindow(PW_RENDERFULLCONTENT) 直接请求窗口自身重绘，可绕开桌面合成器。
+    PW_RENDERFULLCONTENT = 0x00000002
+    # 补救状态下每隔多久试一次 BitBlt，物理屏恢复后自动回到原路径
+    PRINT_WINDOW_RECHECK_INTERVAL = 10
+    # BitBlt 空帧但 PrintWindow 同样无效时，多久之内不重复探测，避免每帧多抓一次
+    PRINT_WINDOW_PROBE_COOLDOWN = 5
+
     def __init__(self, *args, **kwargs):
         logger.info("Window init")
         super().__init__(*args, **kwargs)
 
+    def _bitmap_to_image(self, bitmap, width, height):
+        """把 win32ui 位图转成项目使用的 ndarray（保持原有色彩转换不变）。"""
+        signedIntsArray = bitmap.GetBitmapBits(True)
+        imgSrceen = frombuffer(signedIntsArray, dtype='uint8')
+        imgSrceen.shape = (height, width, 4)
+        # 这点很重要 在alas中图片以np.ndarray（RGB）的顺序存储。但是opencv是以BGR
+        return cv2.cvtColor(imgSrceen, cv2.COLOR_BGR2RGB)
+
+    def _log_throttled(self, attr, interval, message, level='warning'):
+        """同类告警按时间间隔限频，避免虚拟屏下每帧刷屏。"""
+        now = time.time()
+        if now - getattr(self, attr, 0) > interval:
+            setattr(self, attr, now)
+            getattr(logger, level)(message)
+
     def screenshot_window_background(self):
         """
-        后台截屏
-        :return:
+        后台截屏。
+
+        远程桌面 / 虚拟显示器下桌面合成器不呈现模拟器窗口，BitBlt 会持续返回
+        单色空帧（页面识别因此无限 `Page detect miss`）。此时改用
+        PrintWindow(PW_RENDERFULLCONTENT) 要求窗口自身重绘，画面与坐标完全一致，
+        不需要切换截图通道，也不需要重启模拟器。
         """
         if getattr(self, 'is_desktop_window', False):
             return self.screenshot_desktop_bitblt()
@@ -64,23 +102,61 @@ class Window(Handle):
         saveBitMap.CreateCompatibleBitmap(mfcDc, widthScreen, heightScreen)
         # 将截图保存到saveBitMap中
         saveDc.SelectObject(saveBitMap)
-        # 保存bitmap到内存设备描述表
-        saveDc.BitBlt((0, 0), (widthScreen, heightScreen), mfcDc, (0, 0), SRCCOPY)
 
-        # 保存图像
-        signedIntsArray = saveBitMap.GetBitmapBits(True)
-        imgSrceen = frombuffer(signedIntsArray, dtype='uint8')
-        imgSrceen.shape = (heightScreen, widthScreen, 4)
-        # 这点很重要 在alas中图片以np.ndarray（RGB）的顺序存储。但是opencv是以BGR
-        imgSrceen = cv2.cvtColor(imgSrceen, cv2.COLOR_BGR2RGB)
-        # imgSrceen = cv2.resize(imgSrceen, (win_size[0], win_size[1]))
-        # 很奇怪的
+        def bitblt():
+            saveDc.BitBlt((0, 0), (widthScreen, heightScreen), mfcDc, (0, 0), SRCCOPY)
+            return self._bitmap_to_image(saveBitMap, widthScreen, heightScreen)
 
-        # # 测试显示截图图片
-        # cv2.namedWindow('imgSrceen')  # 命名窗口
-        # cv2.imshow("imgSrceen", imgSrceen)  # 显示
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
+        def print_window():
+            if _PRINT_WINDOW is None:
+                return None
+            try:
+                ok = _PRINT_WINDOW(self.screenshot_handle_num, saveDc.GetSafeHdc(),
+                                   self.PW_RENDERFULLCONTENT)
+                if not ok:
+                    return None
+                return self._bitmap_to_image(saveBitMap, widthScreen, heightScreen)
+            except Exception as e:
+                self._log_throttled('_print_window_error_at', 30,
+                                    f'PrintWindow(PW_RENDERFULLCONTENT) failed: {e}')
+                return None
+
+        if getattr(self, '_print_window_fallback', False):
+            # 已确认当前显示环境下 BitBlt 失效：直接走 PrintWindow，
+            # 并周期性探测 BitBlt，重新接上物理屏后自动回到原路径。
+            now = time.time()
+            imgSrceen = None
+            if now - getattr(self, '_print_window_recheck_at', 0) > self.PRINT_WINDOW_RECHECK_INTERVAL:
+                self._print_window_recheck_at = now
+                probe = bitblt()
+                if not is_blank_screenshot(probe):
+                    self._print_window_fallback = False
+                    logger.info('BitBlt screenshot recovered, leaving PrintWindow fallback')
+                    imgSrceen = probe
+            if imgSrceen is None:
+                recovered = print_window()
+                if recovered is not None and not is_blank_screenshot(recovered):
+                    imgSrceen = recovered
+                else:
+                    self._log_throttled(
+                        '_print_window_blank_at', 30,
+                        'PrintWindow also returned a blank frame, '
+                        'Screenshot will fall back to ADB if this persists')
+                    imgSrceen = bitblt()
+        else:
+            imgSrceen = bitblt()
+            if is_blank_screenshot(imgSrceen):
+                now = time.time()
+                if now - getattr(self, '_print_window_probe_at', 0) > self.PRINT_WINDOW_PROBE_COOLDOWN:
+                    self._print_window_probe_at = now
+                    retry = print_window()
+                    if retry is not None and not is_blank_screenshot(retry):
+                        self._print_window_fallback = True
+                        self._print_window_recheck_at = now
+                        logger.warning(
+                            'BitBlt returned a blank frame (virtual/remote display?). '
+                            'Switching window screenshots to PrintWindow(PW_RENDERFULLCONTENT)')
+                        imgSrceen = retry
 
         # 内存释放
         DeleteObject(saveBitMap.GetHandle())

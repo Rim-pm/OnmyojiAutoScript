@@ -3,6 +3,7 @@ import re
 import socket
 import time
 
+import numpy as np
 import uiautomator2 as u2
 from adbutils import AdbTimeout
 from adbutils import _AdbStreamConnection
@@ -13,6 +14,25 @@ from module.logger import logger
 
 RETRY_TRIES = 5
 RETRY_DELAY = 3
+
+
+def is_blank_screenshot(image, threshold=8.0):
+    """判断一帧是否为「近乎纯色的空截图」。
+
+    虚拟屏 / 远程桌面下 GetWindowDC + BitBlt 常返回整屏单色的无效帧，
+    页面识别会因此无限 `Page detect miss`。正常游戏画面的稀疏采样标准差
+    约 60~75，空帧接近 0，用 8 作为分界既不会漏判也不会误伤真实画面。
+    每 16 像素取一个点，单帧开销可忽略。
+    """
+    if image is None:
+        return True
+    try:
+        sample = image[::16, ::16]
+        if getattr(sample, 'ndim', 0) == 3:
+            sample = sample[:, :, :3]
+        return float(np.std(sample)) < threshold
+    except Exception:
+        return True
 
 
 def is_port_using(port_num):
