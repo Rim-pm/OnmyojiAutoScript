@@ -264,7 +264,10 @@ class ScriptTask(RightActivity, Battle, GeneralBattle, SwitchSoul, Star56):
         @return: True 战斗胜利，False 战斗失败
         """
         logger.info('Battle boss')
-        self.ui_click(self.I_TEAM_LOCK, self.I_TEAM_UNLOCK, interval=1.5, timeout=5)
+        # 原先这里有一句 ui_click(I_TEAM_LOCK → I_TEAM_UNLOCK, timeout=5) 想先解锁队伍，
+        # 但超鬼王挑战界面上这两个图标基本认不到（每场都 ui_click timeout，白等 5s），
+        # 实际也从未点中过；而且下面 lock_team_enable=False，锁队与否不影响开打，
+        # 所以直接去掉，只保留点「挑战」。
         self.ui_click_until_disappear(self.I_BATTLE_DEMON, interval=1.8)
         # 任务级战斗计数：本场是第几场（和旧日志 Current count 对齐）
         count = runtime.pub_ctx.per_task.count if runtime.pub_ctx else 0
