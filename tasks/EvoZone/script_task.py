@@ -15,11 +15,43 @@ from tasks.EvoZone.assets import EvoZoneAssets
 from tasks.EvoZone.config import EvoZone, UserStatus, KirinType
 from tasks.Component.GeneralBattle.battle_wait import battle_wait_options, battle_wait_strategy
 
+from module.atom.click import RuleClick
 from module.logger import logger
 from module.exception import TaskEnd
 
 
-class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi, EvoZoneAssets, SwitchSoul):
+class EvoZoneNoClickAreas:
+    """
+    结算 / 胜利界面上人工标注的「禁点区」（1280x720）。
+
+    2026-11-12 由用户提供 6 张标注截图（结算界面、结算界面2、胜利界面，
+    各有实心填充与空心框两版）归纳而来。红框内是奖励物品、式神立绘、
+    式神经验卡、系统消息、buff 倒计时等 UI 控件，兜底随机点击落在上面会
+    把界面点走或弹出无关窗口；红框之外的空白才是可以点的位置。
+
+    坐标为三组标注的并集，取整后略作扩张（用户说明手绘不必太精确）：
+        左上图标     三图 (8,12)-(141,125) / (32,27)-(119,112) / (17,19)-(134,118)
+        右上消息     三图 (610,7)-(1262,76) / (642,0)-(1277,74) / (796,13)-(1272,70)
+        中央主区     结算 (220,137)-(1068,507)，胜利另有 (307,127)-(1060,636)
+        左下 buff    三图 (110,613)-(462,706) / (106,608)-(487,709) / (136,633)-(468,693)
+
+    assets.py 由 assets_extract.py 自动生成、不可手工修改，故这些 EvoZone
+    专属禁区放在这里，由 reward_exclude_click 通过 getattr(self, name) 取用。
+    """
+    C_EVO_NOCLICK_LEFT_TOP = RuleClick(
+        roi_front=(0, 0, 160, 135), roi_back=(0, 0, 160, 135), name='evo_noclick_left_top')
+    C_EVO_NOCLICK_RIGHT_TOP = RuleClick(
+        roi_front=(600, 0, 680, 80), roi_back=(600, 0, 680, 80), name='evo_noclick_right_top')
+    # 下沿取 y=640 而非三图空心框的 602：胜利界面填充版把中央框画到了 636，
+    # 留这段余量才不会在 (490,610)-(909,636) 这条横带上漏点。
+    C_EVO_NOCLICK_CENTER = RuleClick(
+        roi_front=(210, 120, 870, 520), roi_back=(210, 120, 870, 520), name='evo_noclick_center')
+    C_EVO_NOCLICK_LEFT_BOTTOM = RuleClick(
+        roi_front=(100, 605, 390, 110), roi_back=(100, 605, 390, 110), name='evo_noclick_left_bottom')
+
+
+class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi,
+                 EvoZoneAssets, EvoZoneNoClickAreas, SwitchSoul):
 
     def run(self) -> bool:
 
@@ -64,6 +96,20 @@ class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi,
             self.I_FORM_TEAM,    # 觉醒副本选层界面（单人 / 房间已散）
             self.I_GI_HOME,      # 队员被遣回庭院 / 大厅，安静等待队长再次邀请
             self.I_GI_EXPLORE,   # 同上，停在探索界面
+        ]
+        # 兜底点击的取点范围：整屏减去人工标注的禁区。
+        # 旧的 SAFE_REWARD_CLICK_AREA=(248,143,815,460) 几乎整块落在中央禁区里，
+        # 继续沿用它等于必然点到奖励/立绘，所以 completion 单独放开到整屏，
+        # 再由 excludes 精确挖掉 4 块禁区；其余空白处（左右两侧、底部中间、
+        # 顶部中间）保持可点，符合「禁区之外都可以点」的标注。
+        # 注意：只影响 completion 的兜底点击，success 领奖点击仍使用
+        # SAFE_REWARD_CLICK_AREA（OptionSuccessDefault.click_area 未改）。
+        battle_options['completion'].click_area = (0, 0, 1280, 720)
+        battle_options['completion'].excludes = [
+            'C_EVO_NOCLICK_LEFT_TOP',
+            'C_EVO_NOCLICK_RIGHT_TOP',
+            'C_EVO_NOCLICK_CENTER',
+            'C_EVO_NOCLICK_LEFT_BOTTOM',
         ]
         with battle_wait_options(**battle_options):
             match config.evo_zone_config.user_status:
