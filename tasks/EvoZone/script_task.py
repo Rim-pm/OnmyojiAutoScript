@@ -45,15 +45,25 @@ class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi,
             self.close_buff()
 
         success = True
-        # 战斗收尾必须确认真的退回了房间 / 觉醒副本界面。
+        # 战斗收尾必须确认真的离开了结算页。
         # 只靠 success hook 看到奖励图标消失就结束，结算页残留时 battle_wait
         # 会提前返回，run_leader 接着在错误的页面上静默空转直到 GameStuckError。
+        #
+        # check_imgs 要列全「战斗结束后所有合法的落地界面」。只要其中一个出现，
+        # completion hook 就立即结束并把控制权交回 run_leader / run_member；
+        # 都没出现时才会启动兜底随机点击。漏掉合法界面会让兜底点击落到本该由
+        # 任务逻辑处理的界面上：队长首次通关后的「发送邀请 / 默认邀请」弹窗会被
+        # 点掉，check_and_invite 因此看不到 I_UI_CONFIRM、默认邀请永远勾不上；
+        # 队员被遣回大厅等待邀请时则会在大厅里持续乱点。
         _, battle_options = self.loadout_default()
         battle_options['completion'].check_imgs = [
+            self.I_UI_CONFIRM,   # 首次通关后的「发送邀请」弹窗，交给 check_and_invite 勾选默认邀请
             self.I_GI_EMOJI_1,   # 组队房间左下表情按钮
             self.I_GI_SPEAK,     # 没有表情按钮的房间用发言按钮
             self.I_GI_IN_ROOM,   # 协战房间左上角标志
             self.I_FORM_TEAM,    # 觉醒副本选层界面（单人 / 房间已散）
+            self.I_GI_HOME,      # 队员被遣回庭院 / 大厅，安静等待队长再次邀请
+            self.I_GI_EXPLORE,   # 同上，停在探索界面
         ]
         with battle_wait_options(**battle_options):
             match config.evo_zone_config.user_status:
