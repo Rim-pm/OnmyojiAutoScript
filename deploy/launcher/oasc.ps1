@@ -18,6 +18,8 @@
 #   oasc status                       查看各配置脚本实例的运行状态
 #   oasc evo <子命令>                 EvoZone 组队任务（默认 3 个实例：御魂1/2/3）
 #       status | set <键=值>... [--apply] | start | stop | solo [--dry-run] | help
+#       start 默认把三个实例 next_run 统一为「现在-5分钟」再启动，
+#             可用 --at <时刻> 指定时刻、--no-sync 跳过同步（详见 oasc evo help）
 #   oasc solo-evo [配置名...]         = oasc evo solo 的别名
 #   oasc explor-raid [--watch 60] [配置名...]  一键安排探索+个人突破
 #   oasc analyze                      统计探索/突破日志并生成报告
@@ -216,7 +218,9 @@ function Show-Help {
     Write-Host "EvoZone 组队任务（默认 3 个实例：御魂1 队长 + 御魂2/御魂3 队员）："
     Write-Host "  oasc evo status                    只读总览（状态/角色/层数/日志进度）"
     Write-Host "  oasc evo set <键=值>... [--apply]  批量改配置，默认 dry-run"
-    Write-Host "  oasc evo start [--dry-run]         队员先起、队长后起"
+    Write-Host "  oasc evo start [--dry-run]         统一 next_run 后，队员先起、队长后起"
+    Write-Host "      --at <时刻>                    统一执行时刻（默认 现在-5分钟）"
+    Write-Host "      --no-sync                      跳过时间同步，保留原 next_run"
     Write-Host "  oasc evo stop  [--dry-run]         队长先停、队员后停"
     Write-Host "  oasc evo solo  [--dry-run]         独占执行 EvoZone（会禁用其余任务并重启）"
     Write-Host "  oasc solo-evo [配置名...]          = oasc evo solo 的别名"

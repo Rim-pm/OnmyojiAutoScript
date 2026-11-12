@@ -16,10 +16,17 @@ EvoZone（觉醒副本 / 麒麟组队）专属控制 —— `oasc evo <子命令
 命令：
     status                       只读总览：状态、角色、麒麟、层数、限制、日志进度
     set <键=值>... [--apply]     批量修改三个实例的 EvoZone 参数（默认 dry-run）
-    start [--dry-run]            按 member -> leader 顺序启动三个实例
+    start [--dry-run] [--at <时刻>] [--no-sync]
+                                 先把三个实例的 next_run 统一重算（默认 现在-5分钟，
+                                 立即执行），再按 member -> leader 顺序启动
     stop  [--dry-run]            按 leader -> member 顺序停止三个实例
     help                         显示帮助
     （solo 子命令由 oasc.ps1 转交 oas_control.py 的 solo-evo）
+
+为什么 start 要同步时间（与 quick_start_exploration.py 的 explor-raid 同理）：
+    三个实例的 next_run 若各自是历史值，虽然过期时会一起立即执行，但本轮跑完后
+    success_interval=1天 会各自基于自己的 next_run 往后推，下次就不再同步，组队会散。
+    因此 start 默认把三者写成同一时刻；--at 可指定未来时刻，--no-sync 可跳过。
 
 复用 oas_control.py 的 HTTP/WS 工具函数；运行时由 .venv 解释器执行。
 """
@@ -45,7 +52,8 @@ except ImportError:
     sys.exit(1)
 
 from oas_control import (  # noqa: E402
-    ROOT, EVO_CONFIGS, STATE_NAMES, health_check, load_config, set_arg,
+    ROOT, EVO_CONFIGS, STATE_NAMES, IMMEDIATE_LEAD,
+    health_check, load_config, set_arg,
     ws_get_state, start_one, stop_one, pad, _request,
 )
 
@@ -156,6 +164,29 @@ def backend_alive(base: str) -> bool:
         return False
 
 
+def parse_target_time(raw):
+    """解析 --at；未指定则默认「当前时间 - IMMEDIATE_LEAD」立即执行。
+
+    接受 "YYYY-MM-DD HH:MM:SS"、"YYYY-MM-DDTHH:MM:SS" 或 "HH:MM:SS"（今天）。
+    返回去掉微秒的 datetime，微秒会让配置里的 date_time 校验不稳定。
+    """
+    if not raw:
+        return (datetime.now() - IMMEDIATE_LEAD).replace(microsecond=0)
+    raw = raw.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        if fmt == "%H:%M:%S":
+            today = datetime.now()
+            parsed = parsed.replace(year=today.year, month=today.month, day=today.day)
+        return parsed.replace(microsecond=0)
+    print(f"[错误] --at 时间格式无法识别：{raw!r}；"
+          "请用 YYYY-MM-DD HH:MM:SS 或 HH:MM:SS")
+    sys.exit(1)
+
+
 # ------------------------------- 子命令 -------------------------------
 
 async def cmd_status(args, host: str, port: int, configs: list) -> int:
@@ -201,7 +232,10 @@ async def cmd_status(args, host: str, port: int, configs: list) -> int:
     if newest:
         try:
             gap = int((datetime.now() - datetime.strptime(newest, "%Y-%m-%d %H:%M:%S")).total_seconds())
-            flag = "  [注意] 超过 3 分钟无新日志，可能卡住" if gap > 180 else ""
+            flag = ""
+            if gap > 180:
+                flag = ("  [注意] 超过 3 分钟无新日志，可能卡住" if alive
+                        else "  （后端未运行，日志停更属正常）")
             print(f"  最近日志：{newest}（{gap} 秒前）{flag}")
         except ValueError:
             pass
@@ -210,6 +244,11 @@ async def cmd_status(args, host: str, port: int, configs: list) -> int:
     print(f"  角色分工：队长 {'、'.join(leaders) or '无'}；队员 {'、'.join(members) or '无'}")
     enable_str = "、".join(f"{n}={summary(n)['enable']}" for n in configs)
     print(f"  调度启用：{enable_str}")
+    runs = [str(summary(n)["next_run"]) for n in configs]
+    print("  调度时间：" + "；".join(f"{n}={r}" for n, r in zip(configs, runs)))
+    if len(configs) > 1 and len(set(runs)) > 1:
+        print("  [注意] 各实例 next_run 不一致，本轮跑完会各自漂移；"
+              "用 oasc evo start 可重新对齐")
     return 0
 
 
@@ -297,12 +336,47 @@ async def cmd_control(args, host: str, port: int, configs: list, action: str) ->
         why = "先停队长（停止继续发邀请），再停队员"
     verb = "启动" if action == "start" else "停止"
     print(f"EvoZone 组队{verb}（{len(configs)} 个实例）：{why}")
+
+    # start 默认把三个实例的 next_run 写成同一时刻；不这样做的话，本轮跑完后
+    # 各自按 success_interval 从不同的历史值往后推，下一轮组队就散了。
+    sync = action == "start" and not getattr(args, "no_sync", False)
+    target = None
+    if sync:
+        raw_at = getattr(args, "at", None)
+        target = parse_target_time(raw_at)
+        print(f"  同步调度时间：next_run -> {target}  "
+              f"（{'默认 现在-5分钟，立即执行' if not raw_at else '由 --at 指定'}）")
+        for name in configs:
+            print(f"    {pad(name, 12)} {summary(name)['next_run']} -> {target}")
+        disabled = [n for n in configs if summary(n)["enable"] is not True]
+        if disabled:
+            print(f"  [注意] 以下实例 evo_zone 未启用，改 next_run 也不会被调度："
+                  f"{'、'.join(disabled)}")
+        if getattr(args, "only", None):
+            others = [n for n in EVO_CONFIGS if n not in configs]
+            if others:
+                print(f"  [注意] --only 只同步了子集，{'、'.join(others)} 的 next_run "
+                      "保持不变，组队可能不同步")
+    elif action == "start":
+        print("  已用 --no-sync 跳过时间同步（保留各实例原有 next_run）")
+
     for i, name in enumerate(ordered, 1):
         print(f"  {i}. {pad(name, 12)} 角色 {roles[name]}")
     if args.dry_run:
-        print("  [dry-run] 未发送任何启停指令")
+        print("  [dry-run] 未写入配置、未发送任何启停指令")
         return 0
-    health_check(f"http://{host}:{port}")
+    base = f"http://{host}:{port}"
+    health_check(base)
+    if sync:
+        value = target.strftime("%Y-%m-%d %H:%M:%S")
+        failed = [n for n in configs
+                  if not set_arg(base, n, TASK, "scheduler", "next_run",
+                                 "date_time", value)]
+        if failed:
+            print(f"  [中止] 调度时间写入失败（{'、'.join(failed)}），"
+                  "未启动实例，避免组队时间不同步")
+            return 1
+        print("  调度时间已写入（运行中的实例会在任务间隙热加载）")
     fn = start_one if action == "start" else stop_one
     ok = True
     for name in ordered:
@@ -318,12 +392,15 @@ def show_help() -> None:
     print("")
     print("  oasc evo status                    只读总览（状态/角色/层数/日志进度）")
     print("  oasc evo set <键=值>... [--apply]  批量改配置，默认 dry-run")
-    print("  oasc evo start [--dry-run]         按组队顺序启动三个实例")
+    print("  oasc evo start [--dry-run]         同步 next_run 后按组队顺序启动三个实例")
+    print("      --at <时刻>                    统一执行时刻，默认 现在-5分钟（立即执行）")
+    print("      --no-sync                      跳过时间同步，保留各实例原有 next_run")
     print("  oasc evo stop  [--dry-run]         按组队顺序停止三个实例")
     print("  oasc evo solo  [--dry-run]         独占执行 EvoZone（禁用其余任务并重启，副作用大）")
     print("  oasc evo help                      本帮助")
     print("")
     print("  通用选项：--only <配置名> 可重复，只作用于指定实例（status/set/start/stop 均支持）")
+    print("  为什么 start 要同步时间：三个实例 next_run 不同时，本轮跑完会各自漂移，组队会散")
     print("")
     print("可设置的参数：")
     for keys, desc, values in FIELD_HELP:
@@ -333,6 +410,8 @@ def show_help() -> None:
     print("  oasc evo status")
     print("  oasc evo set layer=拾层 count=100 --only 御魂1    # 只预览，不写入")
     print("  oasc evo set layer=拾层 count=100 --apply          # 三个实例一起改")
+    print("  oasc evo start --dry-run                           # 预览时间同步 + 启动顺序")
+    print("  oasc evo start --at 20:00:00                      # 三实例统一在今晚 20:00 执行")
     print("  oasc evo solo --dry-run                            # 预览独占执行计划")
     print("")
     print("注意：探索/突破/爬塔仍默认只跑 御魂1 御魂2，不受 evo 命令影响。")
@@ -353,10 +432,17 @@ def main() -> None:
     p.add_argument("--apply", action="store_true", help="真正写入配置（默认只预览）")
     p.add_argument("--only", action="append", help="只改指定配置，可重复")
 
-    for name, help_text in (("start", "按组队顺序启动"), ("stop", "按组队顺序停止")):
-        p = sub.add_parser(name, help=help_text)
-        p.add_argument("--dry-run", action="store_true", help="只打印顺序，不发送指令")
-        p.add_argument("--only", action="append", help="只操作指定配置，可重复")
+    p = sub.add_parser("start", help="同步 next_run 后按组队顺序启动")
+    p.add_argument("--dry-run", action="store_true", help="只打印计划，不写配置也不启停")
+    p.add_argument("--only", action="append", help="只操作指定配置，可重复")
+    p.add_argument("--at", help="统一执行时刻：YYYY-MM-DD HH:MM:SS 或 HH:MM:SS"
+                                "（默认 现在-5分钟，立即执行）")
+    p.add_argument("--no-sync", action="store_true",
+                   help="不改写 next_run，保留各实例原有调度时间")
+
+    p = sub.add_parser("stop", help="按组队顺序停止")
+    p.add_argument("--dry-run", action="store_true", help="只打印顺序，不发送指令")
+    p.add_argument("--only", action="append", help="只操作指定配置，可重复")
 
     sub.add_parser("help", help="显示帮助")
 
@@ -367,6 +453,8 @@ def main() -> None:
     if args.cmd == "solo":
         print("solo 由 oasc.ps1 转交 oas_control.py 的 solo-evo；请直接用 oasc evo solo --dry-run")
         return
+    if args.cmd == "start" and args.no_sync and args.at:
+        print("[提示] 同时指定了 --no-sync 与 --at，--at 不会生效")
     configs = resolve_configs(getattr(args, "only", None))
     if args.cmd == "status":
         sys.exit(asyncio.run(cmd_status(args, args.host, args.port, configs)))
