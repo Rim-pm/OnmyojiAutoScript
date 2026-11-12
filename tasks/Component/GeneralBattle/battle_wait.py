@@ -450,6 +450,12 @@ class PerBattleIdle:
 class PerBattlePrepare:
     done: bool = False
     timer: Timer = None
+    # 本场是否曾识别到「准备阶段」（准备按钮/预设/加成 buff）
+    seen_prepare: bool = False
+    # 「准备阶段」特征连续消失的累计秒数，用于识别漏检时判定已经进战
+    absent_time: float = 0.0
+    # 上次采样 absent_time 的时间戳，0 表示本场还没采过
+    last_check: float = 0.0
 
 
 @dataclass
@@ -1134,8 +1140,14 @@ class BattleWait(BaseTask, GeneralBattleAssets):
         print('=' * 64)
         time.sleep(0.6)
 
+    # 战斗期间给 stuck 白名单续期的间隔（秒）
+    BATTLE_KEEPALIVE_INTERVAL = 20
+    # 战斗期间续期的总时长上限（秒）：到点撤掉白名单，交还原有的 stuck 检测
+    BATTLE_KEEPALIVE_TIMEOUT = 300
+
     def refresh_long_time(self) -> None:
-        self.device.stuck_record_add('BATTLE_STATUS_S')
+        # 必须同时重置计时器：只 add 不 reset 的话，300s 长计时器到点照样判死
+        self.device.stuck_record_rearm('BATTLE_STATUS_S')
         self.device.click_record_clear()
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -1307,6 +1319,37 @@ class BattleWait(BaseTask, GeneralBattleAssets):
                 enable=('green', 'red', 'echo'),
                 disable=('prepare', 'preset'),
             )
+
+        # ↓↓↓ 进战判据兜底（识别漏检场景）
+        # 原来只认单张 I_BATTLE_INFO：这张图一旦漏检，本 hook 会一直停在准备阶段，
+        # 长战斗白名单也就补不回来（每次点击都会被 handle_control_check 清空），
+        # 于是 60s 后看门狗把正常战斗判成卡死 → 重启游戏 → 战斗白打。
+        # 这里再加两条旁证：
+        #   1) 出现胜利/奖励/失败画面 → 战斗早就开始了，直接交给 success/failure
+        #   2) 准备阶段特征（准备按钮/预设/加成）连续消失 → 认为已经进战
+        now = time.time()
+        if self.is_in_prepare(False):
+            state.seen_prepare = True
+            state.absent_time = 0.0
+            state.last_check = now
+        else:
+            if state.last_check <= 0:
+                state.last_check = now
+            state.absent_time += max(0.0, now - state.last_check)
+            state.last_check = now
+            # 见过准备界面的：准备按钮消失 3s 即可（准备→加载→战斗过渡很快）；
+            # 从没见过准备界面的（多半是识别本身出问题）给 15s 宽限，避免把过渡帧当进战
+            limit = 3.0 if state.seen_prepare else 15.0
+            settlement = self.appear(self.I_WIN) or self.appear(self.I_REWARD) or self.appear(self.I_FALSE)
+            if settlement or state.absent_time >= limit:
+                reason = 'settlement appear' if settlement else f'prepare ui absent {state.absent_time:.1f}s'
+                logger.info(f'Prepare stage finish ({reason})')
+                state.done = True
+                self.refresh_long_time()
+                return runtime.hook_enabled_update(
+                    enable=('green', 'red', 'echo'),
+                    disable=('prepare', 'preset'),
+                )
         # 如果开启了切阵容，就等执行切阵容完成(切阵容操作会自动把准备按钮给按消失), 这里会等8秒钟，时间一到自动关闭准备阶段
         # 切阵容按 per_task 是一次性的：本任务已切过（done）就不再开定时器等，直接按准备开打
         preset_done = next((
@@ -1716,8 +1759,28 @@ class BattleWait(BaseTask, GeneralBattleAssets):
         handlers = [getattr(self, func_name, None) for func_name in battle_wait_plan.sequence_function_names()]
         self.setup_hook(handlers=handlers)
 
+        keepalive_start = time.time()
+        keepalive_last = keepalive_start
+        keepalive_active = True
         while True:
             self.screenshot()
+            # 战斗期间周期性给“长等待”白名单续期。
+            # 战斗中经常会有很长一段时间没有任何可识别画面（长动画、截图通道抽风），
+            # 而每次点击都会走 handle_control_check → stuck_record_clear 把白名单和
+            # 计时器一起清空，于是 60s 的短计时器就会把正常战斗误判成卡死。
+            # 续期有总时长上限：到点就撤掉白名单、交还给原本的 stuck 检测，
+            # 这样真卡死照样会被抓到，正常的超长战斗（一直有点击）也不受影响。
+            now = time.time()
+            if now - keepalive_last >= self.BATTLE_KEEPALIVE_INTERVAL:
+                keepalive_last = now
+                if keepalive_active and now - keepalive_start >= self.BATTLE_KEEPALIVE_TIMEOUT:
+                    keepalive_active = False
+                    self.device.detect_record.discard('BATTLE_STATUS_S')
+                    logger.warning(f'Battle keepalive expired after {now - keepalive_start:.0f}s, '
+                                   f'hand over to stuck detection')
+                # 只续期 stuck 白名单，不动 click_record：保留“连点同一个按钮”的保护
+                if keepalive_active:
+                    self.device.stuck_record_rearm('BATTLE_STATUS_S')
             hook_enabled = runtime.hook_enabled()
             # self.state_show()
             for handler in handlers:

@@ -161,6 +161,24 @@ class Device(DesktopDevice, Platform, Screenshot, Control, AppControl):
         self.stuck_timer.reset()
         self.stuck_timer_long.reset()
 
+    def stuck_record_rearm(self, button=None):
+        """
+        给「长等待」续期：重置两个卡死计时器，同时保留下白名单登记项。
+
+        每次点击都会走 `handle_control_check()` → `stuck_record_clear()`，把
+        detect_record 和两个计时器一起清空。像战斗这种「已知会长时间没有可识别
+        结果、但游戏其实在正常跑」的流程，如果中途再也没有识别成功过（截图通道
+        抽风即如此），60s 的短计时器就会把正常战斗判成卡死（GameStuckError →
+        重启游戏 → 战斗白打）。周期性调用本函数即可让白名单不会过期。
+        :param button: 需要一并登记的白名单项，如 'BATTLE_STATUS_S'
+        :return:
+        """
+        buttons = set(self.detect_record)
+        if button is not None:
+            buttons.add(str(button))
+        self.stuck_record_clear()
+        self.detect_record |= buttons
+
     def stuck_record_check(self):
         """
         Raises:
