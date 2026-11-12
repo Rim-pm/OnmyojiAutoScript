@@ -118,3 +118,38 @@ def test_excluded_regions_covering_screen_are_rejected():
     excluded = RuleClick((0, 0, 1, 1), (0, 0, 1280, 720))
     with pytest.raises(ValueError, match='cover the whole screen'):
         RuleClickExclude(excluded)
+
+
+@pytest.mark.parametrize('strategy', ['rejection', 'complement'])
+def test_click_area_limits_every_sampled_point(strategy):
+    excluded = RuleClick((0, 0, 1, 1), (400, 200, 300, 200))
+    click = RuleClickExclude(excluded, strategy=strategy, distribution='uniform',
+                             area=(248, 143, 815, 460))
+
+    for _ in range(200):
+        x, y = click.coord()
+        assert 248 <= x < 1063
+        assert 143 <= y < 603
+        assert not (400 <= x < 700 and 200 <= y < 400)
+
+
+def test_click_area_is_clipped_to_screen():
+    click = RuleClickExclude([], strategy='complement', distribution='uniform',
+                             area=(1200, 680, 200, 200))
+
+    assert click.area == (1200, 680, 80, 40)
+    for _ in range(100):
+        x, y = click.coord()
+        assert 1200 <= x < 1280
+        assert 680 <= y < 720
+
+
+def test_excluded_regions_outside_click_area_are_ignored():
+    excluded = RuleClick((0, 0, 1, 1), (0, 0, 248, 720))
+    click = RuleClickExclude(excluded, strategy='complement', distribution='uniform',
+                             area=(248, 143, 815, 460))
+
+    assert click._allowed
+    for _ in range(100):
+        x, y = click.coord()
+        assert x >= 248

@@ -120,6 +120,12 @@ _HOOKS_DEFAULT: tuple[str, ...] = (
 )
 _SEQUENCE_DEFAULT: str = 'completion > interrupt > prepare > preset > green > red > echo > success > failure >'
 
+# 结算阶段随机点击的默认安全区 (x, y, w, h)：只取奖励页中央一带。
+# 原来的取点范围是整块屏幕，会落到左上返回、顶部消息、右下角等位置，
+# 把界面点走后 run_leader 会在错误的页面上静默空转。
+# 这个矩形仍会与 options 里的 excludes 求补集，进一步避开奖励物品和底部按钮。
+SAFE_REWARD_CLICK_AREA: tuple[int, int, int, int] = (248, 143, 815, 460)
+
 # 跨任务/跨战斗状态的初始
 @dataclass
 class PerTaskState:
@@ -148,6 +154,13 @@ class OptionInterruptDefault:
 
 @dataclass
 class OptionSuccessDefault:
+    # 领奖随机点击的取点范围，None = 使用 SAFE_REWARD_CLICK_AREA；
+    # 需要放开到整屏时显式传 (0, 0, 1280, 720)。
+    click_area: tuple[int, int, int, int] | None = None
+    # 奖励图标消失后，需要连续多少帧都检测不到才认为领完
+    confirm_frames: int = 2
+    # 本轮一次点击都没有时，容忍多少帧空画面才把 "Win battle" 判为误报
+    mismatch_frames: int = 10
     excludes_1: list[str] = field(default_factory=lambda:
     [
         'C_END_MESSAGE_RIGHT_TOP', 'C_END_BUFF_AREA_1',
@@ -156,7 +169,8 @@ class OptionSuccessDefault:
     excludes_2: list[str] = field(default_factory=lambda:
     [
         'C_END_MESSAGE_RIGHT_TOP', 'C_END_BUFF_AREA_1',
-        'C_END_BUFF_AREA_2', 'C_END_SOUL_RECORD', 'C_END_SOUL_DETAILS',
+        'C_END_BUFF_AREA_2', 'C_END_BUFF_AREA_3',
+        'C_END_SOUL_RECORD', 'C_END_SOUL_DETAILS',
         'C_END_1_1', 'C_END_1_2', 'C_END_1_3', 'C_END_1_4',
         'C_END_1_5', 'C_END_1_6', "C_OVERFLOW_GHOST",
     ])
@@ -166,12 +180,16 @@ class OptionSuccessDefault:
 class OptionCompletionDefault:
     # 这里是为了， 确认结束战斗后退回到 “fire” 的界面
     check_imgs: list[RuleImage] | None = None
-    # 兜底：check_imgs 都检测不到时，间隔点击的排除位
+    # 兜底点击的取点范围，None = 使用 SAFE_REWARD_CLICK_AREA
+    click_area: tuple[int, int, int, int] | None = None
+    # 兜底：check_imgs 都检测不到时，间隔点击的排除位。
+    # 不再把 C_END_MASTER 列为排除区：取点边界已由 click_area 收窄，
+    # 再排除整块中央区域会导致没有任何可点位置。
     excludes: list[str] = field(default_factory=lambda:
     [
         'C_END_MESSAGE_RIGHT_TOP', 'C_END_BUFF_AREA_1',
-        'C_END_BUFF_AREA_2', 'C_END_SOUL_RECORD', 'C_END_SOUL_DETAILS',
-        'C_END_MASTER',
+        'C_END_BUFF_AREA_2', 'C_END_BUFF_AREA_3',
+        'C_END_SOUL_RECORD', 'C_END_SOUL_DETAILS',
     ])
 
 @dataclass
@@ -385,21 +403,28 @@ class PerBattleInterrupt:
 class PerBattleSuccess:
     click_stage_1: RuleClickExclude | None = None
     click_stage_2: RuleClickExclude | None = None
+    # 本轮结算是否真的点过一次（interval 限流没执行的不算）
+    clicked: bool = False
+    # 当前连续多少帧检测不到奖励图标
+    empty_streak: int = 0
 
     @classmethod
     def reward_exclude_click(
             cls,
             onwer,
             areas: list[str] = None,
-            name: str = 'success_exclude_click'
+            name: str = 'success_exclude_click',
+            area: tuple[int, int, int, int] | None = None
     ) -> RuleClickExclude:
         inputs = []
-        for area in areas:
-            click = getattr(onwer, area, None)
+        for area_name in areas or []:
+            click = getattr(onwer, area_name, None)
             if click is None:
-                raise ValueError(f'Unknown success exclusion click: {area!r}')
+                raise ValueError(f'Unknown success exclusion click: {area_name!r}')
             inputs.append(click)
-        return RuleClickExclude(inputs, name=name)
+        if area is None:
+            area = SAFE_REWARD_CLICK_AREA
+        return RuleClickExclude(inputs, name=name, area=area)
 
 
 @dataclass
@@ -1146,7 +1171,9 @@ class BattleWait(BaseTask, GeneralBattleAssets):
             return HookSignal.CONTINUE
         state.fallback_timer.reset()
         if state.click_stage_2 is None:
-            state.click_stage_2 = PerBattleSuccess.reward_exclude_click(self, options.excludes, name='completion_exclude_click')
+            state.click_stage_2 = PerBattleSuccess.reward_exclude_click(
+                self, options.excludes, name='completion_exclude_click',
+                area=options.click_area)
         if self.click(state.click_stage_2, interval=1.5):
             state.fallback_cnt += 1
         # x, y = state.click_stage_2.coord()
@@ -1167,12 +1194,17 @@ class BattleWait(BaseTask, GeneralBattleAssets):
         if not isinstance(state, PerBattleSuccess) or not isinstance(options, OptionSuccessDefault):
             raise
         if state.click_stage_1 is None:
-            state.click_stage_1 = PerBattleSuccess.reward_exclude_click(self, pri.options.excludes_1, name='reward_exclude_click_1')
+            state.click_stage_1 = PerBattleSuccess.reward_exclude_click(
+                self, options.excludes_1, name='reward_exclude_click_1',
+                area=options.click_area)
         if state.click_stage_2 is None:
-            state.click_stage_2 = PerBattleSuccess.reward_exclude_click(self, pri.options.excludes_2, name='reward_exclude_click_2')
+            state.click_stage_2 = PerBattleSuccess.reward_exclude_click(
+                self, options.excludes_2, name='reward_exclude_click_2',
+                area=options.click_area)
 
         if self.appear_then_click(self.I_WIN, interval=0.8):
             self.click(state.click_stage_1)
+            state.clicked = True
             return HookSignal.CONTINUE
         appear_ghost, appear_reward, appear_gold, appear_skin = (
             self.appear(self.I_GREED_GHOST),
@@ -1182,18 +1214,34 @@ class BattleWait(BaseTask, GeneralBattleAssets):
         )
         if not any([appear_ghost, appear_reward, appear_gold, appear_skin]):
             return HookSignal.CONTINUE
+
+        def finish(reason: str) -> HookSignal:
+            if reason == 'reward':
+                logger.info('Get all reward')
+            else:
+                logger.warning(reason)
+            pub.per_battle.success = BattleResult.SUCCESS
+            return runtime.hook_enabled_update(
+                enable=('completion',),
+                disable=('success', 'failure'),
+            )
+
         logger.info('Win battle')
         timer = Timer(20).start()
         while 1:
+            # 超时也要做状态迁移，否则会退回主循环后重新进入 success 形成死循环
+            if timer.reached_and_reset():
+                return finish('battle reward wait timeout, hand over to completion')
             self.screenshot()
 
-            # 结算的时候御魂溢出提示，点击【知道了】
+            # 结算弹窗：处理完直接看下一帧，避免同一帧里再叠加一次随机点击
             if self.appear(self.I_OVER_GHOST):
                 self.click(self.I_OVER_GHOST)
-
-            # 不小心点到了具体的奖励，他会弹出这个物品的详细描述 里面必定包含有“获取途径”
+                continue
+            # 不小心点到具体奖励会弹出物品详情（含“获取途径”），点固定安全位关掉
             if self.appear(self.I_END_FIX_1) or self.appear(self.I_END_FIX_2):
                 self.click(self.C_REWARD_2, interval=1.5)
+                continue
 
             _appear_ghost, _appear_reward, _appear_gold, _appear_skin = (
                 self.appear(self.I_GREED_GHOST, threshold=0.6),
@@ -1201,24 +1249,22 @@ class BattleWait(BaseTask, GeneralBattleAssets):
                 self.appear(self.I_REWARD_GOLD),
                 self.appear(self.I_REWARD_GOLD_SNAKE_SKIN)
             )
-            # logger.info(f'_appear_ghost: {_appear_ghost} _appear_reward: {_appear_reward} _appear_gold: {_appear_gold} _appear_skin: {_appear_skin}')
             if any([_appear_ghost, _appear_reward, _appear_gold, _appear_skin]):
-                if random.random() < 0.02:
-                    # 有一定的概率专门点击具体的奖励物品
-                    x, y = state.click_stage_2.coord_in_excluded(None)
-                    self.device.click(x=x, y=y, control_name='reward_item')
-                    continue
-                self.click(state.click_stage_2, interval=1.5)
-            else:
-                logger.info('Get all reward')
-                pub.per_battle.success = BattleResult.SUCCESS
-                return runtime.hook_enabled_update(
-                    enable=('completion',),
-                    disable=tuple(['success', 'failure']),
-                )
-            if timer.reached_and_reset():
-                logger.warning('battle')
-                break
+                if self.click(state.click_stage_2, interval=1.5):
+                    state.clicked = True
+                state.empty_streak = 0
+                continue
+
+            # 图标消失必须满足两个条件才算领完：本轮真的点过、且连续多帧都检测不到。
+            # 一次点击都没有时说明 "Win battle" 可能只是结算过渡帧的误报，
+            # 继续看下一帧等真正的奖励画面，而不是立刻把战斗判成结束。
+            state.empty_streak += 1
+            if not state.clicked:
+                if state.empty_streak >= options.mismatch_frames:
+                    return finish('Win battle misdetected, hand over to completion')
+                continue
+            if state.empty_streak >= options.confirm_frames:
+                return finish('reward')
         return HookSignal.CONTINUE
 
     def _bw_failure_default(self, pub: PublicContext, pri: PrivateContext) -> HookSignal:
@@ -1526,7 +1572,9 @@ class BattleWait(BaseTask, GeneralBattleAssets):
         if not isinstance(state, PerBattleSuccess) or not isinstance(options, OptionSuccessDefault):
             raise TypeError("battle wait option 'success' must be an OptionSuccessDefault")
         if state.click_stage_1 is None:
-            state.click_stage_1 = PerBattleSuccess.reward_exclude_click(self, options.excludes_1, name='success_exclude_click')
+            state.click_stage_1 = PerBattleSuccess.reward_exclude_click(
+                self, options.excludes_1, name='success_exclude_click',
+                area=options.click_area)
         action_click = state.click_stage_1
         if self.appear_then_click(self.I_WIN, interval=0.8):
             return HookSignal.CONTINUE

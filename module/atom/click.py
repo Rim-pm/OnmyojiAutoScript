@@ -82,7 +82,8 @@ class RuleClickExclude(RuleClick):
     SCREEN_HEIGHT = 720
 
     def __init__(self, clicks, strategy: str | None = None, distribution: str | None = None,
-                 max_attempts: int = 100, name: str = 'exclude_random_click') -> None:
+                 max_attempts: int = 100, name: str = 'exclude_random_click',
+                 area: tuple[int, int, int, int] | None = None) -> None:
         """
         初始化排除区域随机点击规则。
 
@@ -91,11 +92,20 @@ class RuleClickExclude(RuleClick):
         :param distribution: 坐标分布，None 时在初始化时随机选择 uniform 或 normal
         :param max_attempts: 拒绝采样的最大尝试次数，耗尽后自动使用补集矩形采样
         :param name: 点击规则名称，用于 BaseTask.click 的间隔计时器
+        :param area: 限定随机取点的矩形 (x, y, w, h)，None 表示整块屏幕。
+                     结算页的点击应限制在中央安全区，避免落到屏幕四边的
+                     返回 / 消息 / 系统按钮上把界面点走。
         :raises TypeError: clicks 不是 RuleClick 或 RuleClick 序列
         :raises ValueError: strategy、distribution 或 max_attempts 参数无效，或排除区域覆盖整个屏幕
         """
-        super().__init__((0, 0, self.SCREEN_WIDTH, self.SCREEN_HEIGHT),
-                         (0, 0, self.SCREEN_WIDTH, self.SCREEN_HEIGHT), name=name)
+        if area is None:
+            clipped_area = (0, 0, self.SCREEN_WIDTH, self.SCREEN_HEIGHT)
+        else:
+            clipped_area = self._clip_roi(area)
+        if clipped_area is None:
+            raise ValueError('Click area is outside the screen')
+        self.area = clipped_area
+        super().__init__(clipped_area, clipped_area, name=name)
         if strategy is None:
             strategy = random.choice(('rejection', 'complement'))
         if distribution is None:
@@ -117,7 +127,7 @@ class RuleClickExclude(RuleClick):
         self.max_attempts = max_attempts
         self._excluded = tuple(
             rect for click in self.clicks
-            for rect in (self._clip_roi(click.roi_back),)
+            for rect in (self._clip_rect_to_area(self._clip_roi(click.roi_back)),)
             if rect is not None
         )
         self._allowed = self._build_complement()
@@ -128,7 +138,7 @@ class RuleClickExclude(RuleClick):
         click_names = ', '.join(click.name for click in self.clicks) or 'none'
         return (
             f'{self.name}(strategy={self.strategy}, '
-            f'distribution={self.distribution}, clicks=[{click_names}])'
+            f'distribution={self.distribution}, area={self.area}, clicks=[{click_names}])'
         )
 
     __repr__ = __str__
@@ -142,13 +152,26 @@ class RuleClickExclude(RuleClick):
             return None
         return left, top, right - left, bottom - top
 
+    def _clip_rect_to_area(self, rect):
+        """把排除区域裁到取点边界内，完全在边界外的排除项直接丢弃。"""
+        if rect is None:
+            return None
+        ax, ay, aw, ah = self.area
+        x, y, width, height = rect
+        left, top = max(ax, x), max(ay, y)
+        right, bottom = min(ax + aw, x + width), min(ay + ah, y + height)
+        if left >= right or top >= bottom:
+            return None
+        return left, top, right - left, bottom - top
+
     def _is_excluded(self, x, y):
         return any(left <= x < left + width and top <= y < top + height
                    for left, top, width, height in self._excluded)
 
     def _build_complement(self):
-        x_edges = {0, self.SCREEN_WIDTH}
-        y_edges = {0, self.SCREEN_HEIGHT}
+        ax, ay, aw, ah = self.area
+        x_edges = {ax, ax + aw}
+        y_edges = {ay, ay + ah}
         for x, y, width, height in self._excluded:
             x_edges.update((x, x + width))
             y_edges.update((y, y + height))
@@ -175,7 +198,7 @@ class RuleClickExclude(RuleClick):
 
     def _coord_rejection(self, distribution):
         for _ in range(self.max_attempts):
-            point = self._sample_point((0, 0, self.SCREEN_WIDTH, self.SCREEN_HEIGHT), distribution)
+            point = self._sample_point(self.area, distribution)
             if not self._is_excluded(*point):
                 return point
         return self._coord_complement(distribution)

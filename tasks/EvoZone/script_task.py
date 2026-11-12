@@ -13,7 +13,7 @@ from tasks.GameUi.game_ui import GameUi
 from tasks.GameUi.page import page_main, page_awake_zones, page_shikigami_records
 from tasks.EvoZone.assets import EvoZoneAssets
 from tasks.EvoZone.config import EvoZone, UserStatus, KirinType
-from tasks.Component.GeneralBattle.battle_wait import battle_wait_strategy
+from tasks.Component.GeneralBattle.battle_wait import battle_wait_options, battle_wait_strategy
 
 from module.logger import logger
 from module.exception import TaskEnd
@@ -45,17 +45,28 @@ class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi,
             self.close_buff()
 
         success = True
-        match config.evo_zone_config.user_status:
-            case UserStatus.LEADER:
-                success = self.run_leader()
-            case UserStatus.MEMBER:
-                success = self.run_member()
-            case UserStatus.ALONE:
-                self.run_alone()
-            case UserStatus.WILD:
-                self.run_wild()
-            case _:
-                logger.error('Unknown user status')
+        # 战斗收尾必须确认真的退回了房间 / 觉醒副本界面。
+        # 只靠 success hook 看到奖励图标消失就结束，结算页残留时 battle_wait
+        # 会提前返回，run_leader 接着在错误的页面上静默空转直到 GameStuckError。
+        _, battle_options = self.loadout_default()
+        battle_options['completion'].check_imgs = [
+            self.I_GI_EMOJI_1,   # 组队房间左下表情按钮
+            self.I_GI_SPEAK,     # 没有表情按钮的房间用发言按钮
+            self.I_GI_IN_ROOM,   # 协战房间左上角标志
+            self.I_FORM_TEAM,    # 觉醒副本选层界面（单人 / 房间已散）
+        ]
+        with battle_wait_options(**battle_options):
+            match config.evo_zone_config.user_status:
+                case UserStatus.LEADER:
+                    success = self.run_leader()
+                case UserStatus.MEMBER:
+                    success = self.run_member()
+                case UserStatus.ALONE:
+                    self.run_alone()
+                case UserStatus.WILD:
+                    self.run_wild()
+                case _:
+                    logger.error('Unknown user status')
 
         # 记得关掉
         if config.evo_zone_config.soul_buff_enable:
